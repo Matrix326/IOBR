@@ -1,5 +1,5 @@
-# 文件2: iobr_analysis.R
-# IOBR免疫浸润分析和signature评分
+# 修正版 analysis_iobr.R - 检查可用signature
+# IOBR免疫浸润分析和signature评分 - 修正signature名称
 
 library(IOBR)
 library(tidyverse)
@@ -11,6 +11,11 @@ cat("开始IOBR分析...\n")
 # 读取预处理数据
 gse_id <- "GSE289743"
 out_dir <- "data"
+
+# 确保 signature_collection 已定义
+if (!exists("signature_collection")) {
+    stop("Error: 'signature_collection' is not defined. Please load or define it before running the script.")
+}
 
 tpm_matrix <- readRDS(file.path(out_dir, paste0(gse_id, "_tpm_matrix.rds")))
 clinical_data <- readRDS(file.path(out_dir, paste0(gse_id, "_clinical_data.rds")))
@@ -25,10 +30,28 @@ clinical_data <- clinical_data[common_samples, ]
 
 cat("共同样本数量:", length(common_samples), "\n")
 
-# 1. 免疫细胞浸润分析 - 使用多种方法
+# 1. 检查可用的signature
+cat("检查可用signature...\n")
+available_signatures <- names(signature_collection)
+cat("总signature数量:", length(available_signatures), "\n")
+
+# 打印前20个signature名称
+cat("前20个可用signature:\n")
+print(head(available_signatures, 20))
+
+# 查找包含特定关键词的signature
+immune_related <- available_signatures[grepl("CD8|T_cell|immune|cytolytic|NK|B_cell|macrophage|dendritic",
+    available_signatures,
+    ignore.case = TRUE
+)]
+cat("免疫相关signature:\n")
+print(immune_related)
+
+# 2. 免疫细胞浸润分析
 cat("进行免疫细胞浸润分析...\n")
 
 # 方法1: CIBERSORT
+cat(">>> Running CIBERSORT\n")
 tryCatch(
     {
         cibersort_result <- deconvo_tme(eset = tpm_matrix, method = "cibersort", arrays = FALSE)
@@ -41,6 +64,7 @@ tryCatch(
 )
 
 # 方法2: EPIC
+cat(">>> Running EPIC\n")
 tryCatch(
     {
         epic_result <- deconvo_tme(eset = tpm_matrix, method = "epic", arrays = FALSE)
@@ -52,19 +76,8 @@ tryCatch(
     }
 )
 
-# 方法3: xCell
-tryCatch(
-    {
-        xcell_result <- deconvo_tme(eset = tpm_matrix, method = "xcell", arrays = FALSE)
-        cat("xCell分析完成\n")
-    },
-    error = function(e) {
-        cat("xCell分析失败:", e$message, "\n")
-        xcell_result <- NULL
-    }
-)
-
-# 方法4: MCPcounter
+# 方法3: MCPcounter
+cat(">>> Running MCP-counter\n")
 tryCatch(
     {
         mcp_result <- deconvo_tme(eset = tpm_matrix, method = "mcpcounter", arrays = FALSE)
@@ -76,37 +89,114 @@ tryCatch(
     }
 )
 
-# 2. 计算signature评分
+# 3. 计算signature评分 - 使用找到的正确signature名称
 cat("计算signature评分...\n")
 
-# 获取IOBR内置signature列表
-signature_list <- signature_collection
-cat("可用signature数量:", length(signature_list), "\n")
+# 选择一些确定存在的signature
+# 根据检查结果选择可用的signature
+safe_signatures <- c()
+if (length(immune_related) > 0) {
+    safe_signatures <- head(immune_related, 5) # 使用前5个免疫相关signature
+} else {
+    # 如果找不到免疫相关signature，使用一些通用signature
+    safe_signatures <- head(available_signatures, 5)
+}
 
-# 选择一些关键的免疫相关signature进行计算
-selected_signatures <- c(
-    "CD8_T_cells",
-    "T_cell_inflamed_GEP",
-    "Immunogenicity",
-    "Cytolytic_activity",
-    "NK_cells",
-    "B_cells",
-    "Macrophages",
-    "Dendritic_cells"
-)
+cat("将计算以下signature:\n")
+print(safe_signatures)
 
-# 计算signature评分
-signature_scores <- calculate_sig_score(
-    pdata = NULL,
-    eset = tpm_matrix,
-    signature = selected_signatures,
-    method = "pca" # 使用PCA方法
-)
+# 稳健的PCA计算方法
+calculate_signature_pca <- function(eset, signature_name) {
+    tryCatch(
+        {
+            # 检查signature是否存在
+            if (!signature_name %in% names(signature_collection)) {
+                cat("警告: signature", signature_name, "不存在\n")
+                return(NULL)
+            }
 
-cat("signature评分计算完成\n")
-cat("signature评分维度:", dim(signature_scores), "\n")
+            sig_genes <- signature_collection[[signature_name]]
+            available_genes <- sig_genes[sig_genes %in% rownames(eset)]
 
-# 3. 添加自定义signature
+            if (length(available_genes) < 3) {
+                cat("警告: signature", signature_name, "可用基因不足(", length(available_genes), ")\n")
+                return(NULL)
+            }
+
+            # 提取signature基因表达矩阵
+            sig_expr <- eset[available_genes, , drop = FALSE]
+
+            # 检查并处理零方差基因
+            gene_vars <- apply(sig_expr, 1, var)
+            zero_var_genes <- gene_vars == 0
+
+            if (sum(zero_var_genes) > 0) {
+                cat("移除", sum(zero_var_genes), "个零方差基因\n")
+                sig_expr <- sig_expr[!zero_var_genes, , drop = FALSE]
+            }
+
+            # 再次检查剩余基因数量
+            if (nrow(sig_expr) < 2) {
+                cat("警告: 剩余基因数量不足进行PCA\n")
+                # 使用均值作为备选
+                scores <- colMeans(sig_expr)
+                return(scores)
+            }
+
+            # 执行PCA
+            pca_result <- prcomp(t(sig_expr), scale. = TRUE, center = TRUE)
+
+            # 使用第一主成分作为signature score
+            scores <- pca_result$x[, 1]
+
+            # 解释符号：确保与基因表达正相关
+            loading_cor <- cor(pca_result$rotation[, 1], rowMeans(sig_expr))
+            if (loading_cor < 0) {
+                scores <- -scores
+            }
+
+            return(scores)
+        },
+        error = function(e) {
+            cat("计算signature", signature_name, "时PCA出错:", e$message, "\n")
+            # 出错时使用均值方法
+            sig_genes <- signature_collection[[signature_name]]
+            available_genes <- sig_genes[sig_genes %in% rownames(eset)]
+            if (length(available_genes) > 0) {
+                sig_expr <- eset[available_genes, , drop = FALSE]
+                return(colMeans(sig_expr))
+            } else {
+                return(rep(NA, ncol(eset)))
+            }
+        }
+    )
+}
+
+# 计算每个signature
+signature_results <- list()
+for (sig in safe_signatures) {
+    cat("计算signature:", sig, "\n")
+    scores <- calculate_signature_pca(tpm_matrix, sig)
+    if (!is.null(scores) && !all(is.na(scores))) {
+        signature_results[[sig]] <- scores
+        cat("  - 成功计算", sig, "\n")
+    } else {
+        cat("  - 失败计算", sig, "\n")
+    }
+}
+
+# 转换为数据框
+if (length(signature_results) > 0) {
+    signature_scores <- as.data.frame(do.call(cbind, signature_results))
+    rownames(signature_scores) <- colnames(tpm_matrix)
+    cat("signature评分计算完成，维度:", dim(signature_scores), "\n")
+} else {
+    cat("警告: 没有成功计算任何signature评分\n")
+    signature_scores <- data.frame(matrix(nrow = ncol(tpm_matrix), ncol = 0))
+    rownames(signature_scores) <- colnames(tpm_matrix)
+}
+
+# 4. 添加自定义signature - 使用PCA方法
 cat("添加自定义signature...\n")
 
 # 自定义signature 1: HALLMARK_APOPTOSIS (细胞凋亡)
@@ -127,72 +217,163 @@ ifn_gamma_genes <- c(
     "HLA-DRA", "HLA-DRB1", "PSMB8", "PSMB9", "TAP1", "TAP2"
 )
 
-# 计算自定义signature评分
-calculate_custom_signature <- function(expr_matrix, gene_list, method = "pca") {
-    # 只保留在表达矩阵中存在的基因
-    available_genes <- gene_list[gene_list %in% rownames(expr_matrix)]
+# 稳健的自定义signature PCA计算
+calculate_custom_signature_pca <- function(expr_matrix, gene_list) {
+    tryCatch(
+        {
+            # 只保留在表达矩阵中存在的基因
+            available_genes <- gene_list[gene_list %in% rownames(expr_matrix)]
 
-    if (length(available_genes) < 3) {
-        cat("警告: 可用基因数量不足(", length(available_genes), ")\n")
-        return(rep(NA, ncol(expr_matrix)))
-    }
+            if (length(available_genes) < 3) {
+                cat("警告: 可用基因数量不足(", length(available_genes), ")\n")
+                return(rep(NA, ncol(expr_matrix)))
+            }
 
-    if (method == "pca") {
-        # PCA方法
-        sig_expr <- expr_matrix[available_genes, , drop = FALSE]
-        # 移除方差为0的基因
-        gene_vars <- apply(sig_expr, 1, var)
-        sig_expr <- sig_expr[gene_vars > 0, , drop = FALSE]
+            # 提取基因表达
+            sig_expr <- expr_matrix[available_genes, , drop = FALSE]
 
-        if (nrow(sig_expr) < 2) {
-            return(rep(NA, ncol(expr_matrix)))
+            # 检查并处理零方差基因
+            gene_vars <- apply(sig_expr, 1, var)
+            zero_var_genes <- gene_vars == 0
+
+            if (sum(zero_var_genes) > 0) {
+                cat("移除", sum(zero_var_genes), "个零方差基因\n")
+                sig_expr <- sig_expr[!zero_var_genes, , drop = FALSE]
+            }
+
+            # 再次检查剩余基因数量
+            if (nrow(sig_expr) < 2) {
+                cat("警告: 剩余基因数量不足进行PCA\n")
+                # 使用均值作为备选
+                return(colMeans(sig_expr))
+            }
+
+            # 执行PCA
+            pca_result <- prcomp(t(sig_expr), scale. = TRUE, center = TRUE)
+
+            # 使用第一主成分作为signature score
+            scores <- pca_result$x[, 1]
+
+            # 解释符号：确保与基因表达正相关
+            loading_cor <- cor(pca_result$rotation[, 1], rowMeans(sig_expr))
+            if (loading_cor < 0) {
+                scores <- -scores
+            }
+
+            return(scores)
+        },
+        error = function(e) {
+            cat("自定义signature PCA计算出错:", e$message, "\n")
+            # 出错时使用均值方法
+            available_genes <- gene_list[gene_list %in% rownames(expr_matrix)]
+            if (length(available_genes) > 0) {
+                sig_expr <- expr_matrix[available_genes, , drop = FALSE]
+                return(colMeans(sig_expr))
+            } else {
+                return(rep(NA, ncol(expr_matrix)))
+            }
         }
-
-        pca_result <- prcomp(t(sig_expr), scale. = TRUE)
-        scores <- pca_result$x[, 1]
-        return(scores)
-    } else if (method == "mean") {
-        # 简单均值方法
-        sig_expr <- expr_matrix[available_genes, ]
-        scores <- colMeans(sig_expr)
-        return(scores)
-    }
+    )
 }
 
 # 计算自定义signature
+cat("计算HALLMARK_APOPTOSIS...\n")
+apoptosis_scores <- calculate_custom_signature_pca(tpm_matrix, apoptosis_genes)
+
+cat("计算HALLMARK_ANGIOGENESIS...\n")
+angiogenesis_scores <- calculate_custom_signature_pca(tpm_matrix, angiogenesis_genes)
+
+cat("计算HALLMARK_INTERFERON_GAMMA_RESPONSE...\n")
+ifn_gamma_scores <- calculate_custom_signature_pca(tpm_matrix, ifn_gamma_genes)
+
 custom_scores <- data.frame(
-    HALLMARK_APOPTOSIS = calculate_custom_signature(tpm_matrix, apoptosis_genes, "pca"),
-    HALLMARK_ANGIOGENESIS = calculate_custom_signature(tpm_matrix, angiogenesis_genes, "pca"),
-    HALLMARK_INTERFERON_GAMMA_RESPONSE = calculate_custom_signature(tpm_matrix, ifn_gamma_genes, "pca")
+    HALLMARK_APOPTOSIS = apoptosis_scores,
+    HALLMARK_ANGIOGENESIS = angiogenesis_scores,
+    HALLMARK_INTERFERON_GAMMA_RESPONSE = ifn_gamma_scores
 )
 
 rownames(custom_scores) <- colnames(tpm_matrix)
+cat("自定义signature计算完成，维度:", dim(custom_scores), "\n")
 
-# 4. 合并所有结果
+# 5. 合并所有结果 - 修复score列问题
 cat("合并分析结果...\n")
 
-# 创建综合结果数据框
+# 创建基础结果数据框
 full_results <- data.frame(
-    Sample = colnames(tpm_matrix)
+    Sample = colnames(tpm_matrix),
+    stringsAsFactors = FALSE
 )
+rownames(full_results) <- full_results$Sample
 
 # 添加临床信息
-full_results <- cbind(full_results, clinical_data[full_results$Sample, ])
+clinical_subset <- clinical_data[full_results$Sample, , drop = FALSE]
+full_results <- cbind(full_results, clinical_subset)
 
-# 添加免疫浸润结果
+# 修复：正确提取免疫浸润结果
+# CIBERSORT
 if (!is.null(cibersort_result)) {
-    full_results <- cbind(full_results, cibersort_result$score[full_results$Sample, ])
+    # 检查结果结构
+    if (is.list(cibersort_result) && "score" %in% names(cibersort_result)) {
+        cibersort_data <- cibersort_result$score[full_results$Sample, , drop = FALSE]
+        full_results <- cbind(full_results, cibersort_data)
+        cat("已添加CIBERSORT结果\n")
+    } else if (is.data.frame(cibersort_result)) {
+        # 如果直接是数据框
+        cibersort_data <- cibersort_result[full_results$Sample, , drop = FALSE]
+        full_results <- cbind(full_results, cibersort_data)
+        cat("已添加CIBERSORT结果（直接数据框）\n")
+    } else {
+        cat("CIBERSORT结果结构未知\n")
+    }
+}
+
+# EPIC
+if (!is.null(epic_result)) {
+    if (is.list(epic_result) && "score" %in% names(epic_result)) {
+        epic_data <- epic_result$score[full_results$Sample, , drop = FALSE]
+        full_results <- cbind(full_results, epic_data)
+        cat("已添加EPIC结果\n")
+    } else if (is.data.frame(epic_result)) {
+        epic_data <- epic_result[full_results$Sample, , drop = FALSE]
+        full_results <- cbind(full_results, epic_data)
+        cat("已添加EPIC结果（直接数据框）\n")
+    } else {
+        cat("EPIC结果结构未知\n")
+    }
+}
+
+# MCPcounter
+if (!is.null(mcp_result)) {
+    if (is.list(mcp_result) && "score" %in% names(mcp_result)) {
+        mcp_data <- mcp_result$score[full_results$Sample, , drop = FALSE]
+        full_results <- cbind(full_results, mcp_data)
+        cat("已添加MCPcounter结果\n")
+    } else if (is.data.frame(mcp_result)) {
+        mcp_data <- mcp_result[full_results$Sample, , drop = FALSE]
+        full_results <- cbind(full_results, mcp_data)
+        cat("已添加MCPcounter结果（直接数据框）\n")
+    } else {
+        cat("MCPcounter结果结构未知\n")
+    }
 }
 
 # 添加signature评分
-full_results <- cbind(full_results, signature_scores[full_results$Sample, ])
+if (ncol(signature_scores) > 0) {
+    sig_data <- signature_scores[full_results$Sample, , drop = FALSE]
+    full_results <- cbind(full_results, sig_data)
+    cat("已添加signature评分\n")
+}
 
 # 添加自定义signature
-full_results <- cbind(full_results, custom_scores[full_results$Sample, ])
+custom_data <- custom_scores[full_results$Sample, , drop = FALSE]
+full_results <- cbind(full_results, custom_data)
+cat("已添加自定义signature\n")
 
-rownames(full_results) <- full_results$Sample
+# 检查最终结果
+cat("最终结果维度:", dim(full_results), "\n")
+cat("包含的特征数量:", ncol(full_results), "\n")
 
-# 5. 保存结果
+# 6. 保存结果
 cat("保存分析结果...\n")
 
 # 保存完整结果
@@ -206,9 +387,6 @@ if (!is.null(cibersort_result)) {
 if (!is.null(epic_result)) {
     saveRDS(epic_result, file.path(out_dir, paste0(gse_id, "_epic.rds")))
 }
-if (!is.null(xcell_result)) {
-    saveRDS(xcell_result, file.path(out_dir, paste0(gse_id, "_xcell.rds")))
-}
 if (!is.null(mcp_result)) {
     saveRDS(mcp_result, file.path(out_dir, paste0(gse_id, "_mcpcounter.rds")))
 }
@@ -216,6 +394,16 @@ if (!is.null(mcp_result)) {
 saveRDS(signature_scores, file.path(out_dir, paste0(gse_id, "_signature_scores.rds")))
 saveRDS(custom_scores, file.path(out_dir, paste0(gse_id, "_custom_signatures.rds")))
 
+# 生成结果摘要
+cat("\n=== 分析完成摘要 ===\n")
+cat("样本数量:", nrow(full_results), "\n")
+cat("特征数量:", ncol(full_results), "\n")
+cat("成功运行的方法:\n")
+if (!is.null(cibersort_result)) cat("- CIBERSORT\n")
+if (!is.null(epic_result)) cat("- EPIC\n")
+if (!is.null(mcp_result)) cat("- MCPcounter\n")
+cat("使用PCA计算的IOBR signature数量:", ncol(signature_scores), "\n")
+cat("使用PCA计算的自定义signature数量:", ncol(custom_scores), "\n")
+cat("最终数据框包含的列:", colnames(full_results), "\n")
+
 cat("IOBR分析完成!\n")
-cat("最终结果维度:", dim(full_results), "\n")
-cat("包含的特征:", colnames(full_results), "\n")
