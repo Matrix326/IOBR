@@ -1,0 +1,6 @@
+{
+    "r.rterm.windows": "D:/R/R-4.5.2/bin/R.exe", // 根据你安装路径调整
+    "r.rterm.option": [],
+    "r.sessionWatcher": true,
+    "r.alwaysUseActiveTerminal": true
+}
