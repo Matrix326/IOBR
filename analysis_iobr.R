@@ -305,6 +305,20 @@ full_results <- data.frame(
 )
 rownames(full_results) <- full_results$Sample
 
+# 新增：将signature_scores合并到full_results中
+# 假设signature_scores的行名是Sample（与full_results匹配）
+full_results <- cbind(full_results, signature_scores[full_results$Sample, ])
+
+# 补充聚类环节（完全匹配GitBook中的tme_cluster格式）
+tme_result <- tme_cluster(
+  input = full_results,          # 输入数据框（你的full_results）
+  features = colnames(signature_scores),  # 聚类用的特征列（如Signature评分）
+  id = "Sample",                 # 样本ID对应的列名（替换为你数据中实际的样本ID列）
+  scale = TRUE,                  # 对特征列做标准化（聚类前必须步骤）
+  method = "kmeans",             # 聚类算法（GitBook中示例用了kmeans）
+  max.nc = 3                     # 聚类的类别数（比如聚为3个TME亚型，对应之前的k=3）
+)
+
 # 添加临床信息
 clinical_subset <- clinical_data[full_results$Sample, , drop = FALSE]
 full_results <- cbind(full_results, clinical_subset)
@@ -407,3 +421,185 @@ cat("使用PCA计算的自定义signature数量:", ncol(custom_scores), "\n")
 cat("最终数据框包含的列:", colnames(full_results), "\n")
 
 cat("IOBR分析完成!\n")
+
+# 加载依赖包
+library(IOBR)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+
+# ===================== 关键：与数据处理的保存路径统一 =====================
+gse_id <- "GSE289743"  # 需与数据处理代码中的gse_id保持一致
+out_dir_data <- "data"  # 与数据处理代码中“保存结果的out_dir”保持一致
+out_dir_plot <- "./output"  # 图保存到output文件夹（同代码文件目录）
+
+# 自动创建output文件夹（若不存在）
+if (!dir.exists(out_dir_plot)) {
+  dir.create(out_dir_plot)
+}
+
+
+# ===================== 读取数据处理保存的结果 =====================
+# 读取完整结果（对应数据处理中保存的full_iobr_results）
+full_results <- readRDS(file.path(out_dir_data, paste0(gse_id, "_full_iobr_results.rds")))
+# 读取CIBERSORT结果（对应数据处理中保存的cibersort.rds）
+cibersort_result <- readRDS(file.path(out_dir_data, paste0(gse_id, "_cibersort.rds")))
+# 读取Signature评分结果（对应数据处理中保存的signature_scores.rds）
+signature_scores <- readRDS(file.path(out_dir_data, paste0(gse_id, "_signature_scores.rds")))
+
+
+# ===================== 可视化（图保存到output） =====================
+# ========== 可视化（图保存到/output） ==========
+
+# 检查signature_scores的类型和维度
+cat("Signature_scores类型：", class(signature_scores), "\n")
+cat("Signature_scores维度：", dim(signature_scores), "\n")
+
+# 检查full_results的列名
+cat("full_results列名：", colnames(full_results), "\n")
+
+
+
+# ========== 第一步：强制清理full_results的重复列名（必须放在所有绘图代码之前） ==========
+# 给重复列名添加唯一后缀（如ID -> ID.1, ID.2）
+colnames(full_results) <- make.unique(colnames(full_results))
+
+
+# ========== 前置：检查核心数据有效性 ==========
+# 1. 检查full_results的response列是否有非NA值
+cat("response列非NA数量：", sum(!is.na(full_results$response)), "\n")
+# 若结果为0，说明response列全是NA，需换其他分组列（比如tissue列）
+if (sum(!is.na(full_results$response)) == 0) {
+  warning("response列全是NA，将使用tissue列作为分组！")
+  group_col <- "tissue"
+} else {
+  group_col <- "response"
+}
+
+# 2. 检查cibersort_result的列（确保有免疫细胞列）
+cat("cibersort_result的列数：", ncol(cibersort_result), "\n")
+cat("cibersort_result的前5列：", head(colnames(cibersort_result), 5), "\n")
+
+
+
+
+# ========== 1. 免疫细胞浸润bar图（彻底修复） ==========
+cat("绘制免疫细胞浸润bar图...\n")
+
+# 步骤1：处理cibersort_result（用ID列匹配Sample，筛选细胞列）
+cibersort_cells <- cibersort_result %>%
+  dplyr::rename(Sample = ID) %>%  # 将cibersort的ID列重命名为Sample，匹配full_results
+  dplyr::select(-dplyr::contains(c("P-value", "Correlation", "RMSE")))  # 剔除评估列
+# 只保留免疫细胞列（列名含"CIBERSORT"）
+cibersort_cells <- cibersort_cells %>%
+  dplyr::select(Sample, dplyr::contains("CIBERSORT"))
+
+# 步骤2：合并full_results的分组信息（response）
+input_data <- cibersort_cells %>%
+  dplyr::left_join(full_results[, c("Sample", "response")], by = "Sample")
+
+# 步骤3：绘图（确保features是细胞列）
+p <- cell_bar_plot(
+  input = input_data,
+  id = "Sample",
+  features = setdiff(colnames(cibersort_cells), "Sample"),  # 排除Sample列，只取细胞列
+  title = "TME Cell Infiltration (CIBERSORT)"  # 英文标题消除编码警告
+)
+ggsave(file.path(out_dir_plot, "cell_infiltration_bar.pdf"), plot = p, width = 12, height = 6)
+
+
+# ========== 2. Signature评分PCA图（终极简化+纯数值矩阵保证） ==========
+cat("绘制Signature评分PCA图...\n")
+
+# 步骤1：直接处理signature_scores为纯数值矩阵（核心：跳过冗余data.frame操作）
+# 检查signature_scores每列类型并强制转数值
+sig_cols_type <- sapply(signature_scores, class)
+cat("signature_scores各列原始类型：", sig_cols_type, "\n")
+
+# 强制将所有列转为数值型（直接在data.frame上操作）
+signature_scores_num <- signature_scores %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), ~as.numeric(.x)))
+
+# 步骤2：转为纯数值矩阵（确保data参数是数值矩阵）
+sig_matrix <- as.matrix(signature_scores_num)
+cat("sig_matrix类型：", class(sig_matrix), "；是否纯数值：", all(sapply(sig_matrix, is.numeric)), "\n")
+
+# 步骤3：绑定样本与分组（用signature_scores的行名匹配full_results的Sample）
+sig_with_group <- tibble::tibble(Sample = rownames(signature_scores)) %>%
+  dplyr::inner_join(full_results[, c("Sample", "tissue")], by = "Sample")
+
+# 步骤4：调用iobr_pca（直接传入纯数值矩阵）
+p <- iobr_pca(
+  data = sig_matrix,
+  pdata = sig_with_group,
+  id_pdata = "Sample",
+  group = "tissue",
+  addEllipses = TRUE
+)
+
+# 保存PCA图
+p <- p + ggplot2::labs(title = "Signature PCA Distribution")
+ggsave(file.path(out_dir_plot, "signature_pca.pdf"), plot = p, width = 8, height = 6)
+
+
+# 3. Signature评分热图（修正保存方式）
+cat("绘制Signature评分热图...\n")
+
+# 步骤1：合并数据
+input_data <- signature_scores %>%
+  tibble::rownames_to_column(var = "Sample") %>%
+  dplyr::left_join(full_results[, c("Sample", "response")], by = "Sample")
+
+# 步骤2：调用sig_heatmap
+p <- sig_heatmap(
+  input = input_data,
+  ID = "Sample",
+  features = colnames(signature_scores),
+  group = "response",
+  show_heatmap_col_name = TRUE,
+  column_title = "不同样本Signature评分热图",
+  palette = 2
+)
+
+# 步骤3：保存热图（用pdf设备适配InputHeatmap对象）
+pdf(file.path(out_dir_plot, "signature_heatmap.pdf"), width = 10, height = 8)
+print(p)  # 打印热图对象到pdf设备
+dev.off()  # 关闭设备
+
+# ========== 4. CD8+T细胞Signature分组箱型图（修复函数缺失问题） ==========
+cat("绘制CD8+T细胞Signature分组箱型图...\n")
+
+# 步骤0：安装并加载依赖包（stat_compare_means属于ggpubr）
+if (!require("ggpubr", quietly = TRUE)) {
+  install.packages("ggpubr", dependencies = TRUE)
+  library(ggpubr)
+} else {
+  library(ggpubr)
+}
+
+# 步骤1：确认CD8列名
+cd8_col <- "CD8_Rooney_et_al"
+if (!cd8_col %in% colnames(signature_scores)) {
+  stop(paste("未找到列：", cd8_col))
+}
+
+# 步骤2：合并数据
+input_data <- signature_scores %>%
+  tibble::rownames_to_column(var = "Sample") %>%
+  dplyr::select(Sample, all_of(cd8_col)) %>%
+  dplyr::left_join(full_results[, c("Sample", "response")], by = "Sample")
+
+# 步骤3：绘图（确保ggpubr已加载）
+p <- sig_box(
+  data = input_data,
+  signature = cd8_col,
+  variable = "response"
+)
+
+# 补充标题并保存
+p <- p + 
+  ggplot2::labs(title = "CD8+T Cell Signature by Response")
+ggsave(file.path(out_dir_plot, "CD8_T_cells_boxplot.pdf"), plot = p, width = 6, height = 5)
+
+cat("所有可视化完成！\n- 数据来自：", out_dir_data, "\n- 图保存至：", out_dir_plot, "\n")
+
