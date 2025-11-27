@@ -4,7 +4,8 @@ options(repos = c(CRAN = "https://cloud.r-project.org"))
 # CRAN 包
 cran_pkgs <- c(
     "data.table", "tidyverse", "pheatmap", "ggplot2", "cowplot",
-    "remotes", "devtools", "rmarkdown", "BiocManager", "ComplexHeatmap"
+    "remotes", "devtools", "rmarkdown", "BiocManager", "ComplexHeatmap",
+  "NbClust"
 )
 
 for (p in cran_pkgs) {
