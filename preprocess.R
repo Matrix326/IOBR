@@ -6,7 +6,7 @@ library(tidyverse)
 library(data.table)
 
 # 设置工作目录
-setwd("d:\\VscodePrograms\\IOBR")
+setwd("d:\\VscodePrograms\\IOBR") #要与你电脑上的IOBR文件夹所在位置一致，用实际工作目录替换
 
 gse_id <- "GSE289743"
 out_dir <- "data"
